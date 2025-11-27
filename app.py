@@ -7,6 +7,7 @@ import plotly.graph_objects as go
 from datetime import datetime
 import numpy as np
 import time
+from fetcher import fetch_realtime_data, SUPPORTED_CITIES
 
 # ================================
 # CONFIGURATIONS
@@ -17,36 +18,8 @@ st.set_page_config(
     layout="wide"
 )
 
-# OpenAQ API Key
-API_KEY = "e9810a7ae0097cc9d6313383143b9a00d3b104b4fd0ff8a115fe80669c9242ab"
-HEADERS = {"X-API-Key": API_KEY}
-
-# City Mapping
-CITY_ID_MAPPING = {
-  "Delhi - ITO": 103,
-  "Delhi - DTU": 13,
-  "Delhi - R K Puram": 17,
-  "Delhi - Punjabi Bagh": 50,
-  "Delhi - Anand Vihar": 235,
-  "Gurugram - Vikas Sadan": 301,
-  "Hyderabad - Zoo Park": 407,
-  "Hyderabad - Sanathnagar": 408,
-  "Noida - Sector 125": 5598,
-  "Noida - Sector 62": 5616,
-  "Pune - Karve Road": 5661,
-  "Ahmedabad - Maninagar": 5631,
-  "Lucknow - Lalbagh": 2456,
-  "Bengaluru - Peenya": 5607,
-  "Bengaluru - Silk Board": 6975,
-  "Bengaluru - Hombegowda Nagar": 6983,
-  "Bengaluru - Hebbal": 6980,
-  "Bengaluru - BTM Layout": 412,
-  "Chennai - Manali": 2461,
-  "Kolkata - Jadavpur": 716,
-  "Jaipur - Shastri Nagar": 5612
-}
-
-SUPPORTED_CITIES = list(CITY_ID_MAPPING.keys())
+# Cities and Data Fetching logic imported from fetcher.py to ensure consistency
+# and use the latest fixes (e.g. unit conversion).
 
 # ================================
 # MODEL LOADING
@@ -64,6 +37,14 @@ FEATURE_COLUMNS = [
     'NH3','CO','SO2','O3','Benzene','Toluene','Xylene'
 ]
 
+# Default values for imputation (25th percentile of training data)
+# Using conservative values to avoid over-predicting AQI when data is missing
+DEFAULT_VALUES = {
+    'PM2.5': 28.16, 'PM10': 64.00, 'NO': 3.05, 'NO2': 13.10,
+    'NOx': 11.35, 'NH3': 11.23, 'CO': 0.41, 'SO2': 4.25,
+    'O3': 11.02, 'Benzene': 0.08, 'Toluene': 0.34, 'Xylene': 0.00
+}
+
 def get_aqi_bucket(aqi):
     if aqi <= 50: return "Good"
     elif aqi <= 100: return "Satisfactory"
@@ -73,17 +54,8 @@ def get_aqi_bucket(aqi):
     else: return "Severe"
 
 def predict_aqi(data_dict):
-    # Preprocess
-    missing = [col for col in FEATURE_COLUMNS if col not in data_dict]
-    if missing:
-        # Fill missing with median/default if needed for robustness in demo
-        for m in missing:
-            data_dict[m] = 0 # Or some default
-            
+    # Data is already imputed and smoothed in update_data
     df = pd.DataFrame([data_dict], columns=FEATURE_COLUMNS)
-    df = df.replace({None: np.nan})
-    # Simple fillna for demo robustness
-    df = df.fillna(0) 
     
     scaled = scaler.transform(df)
     aqi_pred = model.predict(scaled)[0]
@@ -97,60 +69,7 @@ def predict_aqi(data_dict):
 # ================================
 # DATA FETCHING
 # ================================
-def fetch_realtime_data(city):
-    location_id = CITY_ID_MAPPING.get(city)
-    if not location_id: return None
-
-    # V3 Strategy: List endpoint -> Find ID -> Get Sensors -> Get Measurements
-    url_loc = "https://api.openaq.org/v3/locations"
-    params_loc = {"iso": "IN", "limit": 1000}
-    
-    try:
-        resp_loc = requests.get(url_loc, headers=HEADERS, params=params_loc)
-        if resp_loc.status_code != 200: return None
-        
-        results = resp_loc.json().get("results", [])
-        target_loc = next((loc for loc in results if loc['id'] == location_id), None)
-        
-        if not target_loc: return None
-        sensors = target_loc.get("sensors", [])
-        if not sensors: return None
-
-        pollutant_map = {}
-        target_pollutants = ["pm25", "pm10", "no", "no2", "nox", "nh3", "co", "so2", "o3", "benzene", "toluene", "xylene"]
-        
-        for sensor in sensors:
-            param_name = sensor.get("parameter", {}).get("name", "").lower()
-            if param_name in target_pollutants:
-                sensor_id = sensor["id"]
-                try:
-                    url_meas = f"https://api.openaq.org/v3/sensors/{sensor_id}/measurements"
-                    resp_meas = requests.get(url_meas, headers=HEADERS, params={"limit": 1})
-                    if resp_meas.status_code == 200:
-                        meas_res = resp_meas.json().get("results", [])
-                        if meas_res:
-                            pollutant_map[param_name] = meas_res[0].get("value")
-                except:
-                    pass
-
-        if not pollutant_map: return None
-
-        return {
-            "PM2.5": pollutant_map.get("pm25"),
-            "PM10": pollutant_map.get("pm10"),
-            "NO": pollutant_map.get("no"),
-            "NO2": pollutant_map.get("no2"),
-            "NOx": pollutant_map.get("nox"),
-            "NH3": pollutant_map.get("nh3"),
-            "CO": pollutant_map.get("co"),
-            "SO2": pollutant_map.get("so2"),
-            "O3": pollutant_map.get("o3"),
-            "Benzene": pollutant_map.get("benzene"),
-            "Toluene": pollutant_map.get("toluene"),
-            "Xylene": pollutant_map.get("xylene"),
-        }
-    except:
-        return None
+# fetch_realtime_data is imported from fetcher.py
 
 # ================================
 # DASHBOARD UI
@@ -167,16 +86,63 @@ auto_fetch = st.sidebar.checkbox("Enable Active Auto-Fetch", value=True)
 if "data_history" not in st.session_state:
     st.session_state["data_history"] = pd.DataFrame(columns=["timestamp", "City", "Predicted_AQI", "Predicted_Bucket"] + FEATURE_COLUMNS)
 
+# Store latest smoothed values for each city to enable Forward Fill and EMA
+if "city_tracker" not in st.session_state:
+    st.session_state["city_tracker"] = {}
+
 def update_data(city):
     with st.spinner(f"Fetching data for {city}..."):
-        raw = fetch_realtime_data(city)
-        if raw:
-            pred = predict_aqi(raw)
+        raw_new = fetch_realtime_data(city)
+        
+        # Even if API fails (returns None), we might want to show stale data if we have it?
+        # But fetch_realtime_data returns None on total failure.
+        # Let's assume if it returns None, we can't do much update, but we could re-predict on old data?
+        # For now, let's only update if we get *some* data (even partial).
+        
+        if raw_new:
+            # Initialize city tracker if not present
+            if city not in st.session_state["city_tracker"]:
+                st.session_state["city_tracker"][city] = {}
+
+            prev_data = st.session_state["city_tracker"][city]
+            smoothed_data = {}
+            alpha = 0.3 # Smoothing factor (0.3 = keep 70% old, take 30% new). Lower = smoother.
+
+            for col in FEATURE_COLUMNS:
+                new_val = raw_new.get(col)
+                old_val = prev_data.get(col)
+
+                final_val = 0
+
+                # Case 1: New value exists
+                if new_val is not None:
+                    if old_val is not None:
+                        # EMA Smoothing
+                        final_val = (alpha * new_val) + ((1 - alpha) * old_val)
+                    else:
+                        # First value seen
+                        final_val = new_val
+                
+                # Case 2: New value missing, but we have history (Forward Fill)
+                elif old_val is not None:
+                    final_val = old_val
+                
+                # Case 3: Cold Start (No new, no old) -> Use Conservative Default
+                else:
+                    final_val = DEFAULT_VALUES.get(col, 0)
+
+                smoothed_data[col] = final_val
+            
+            # Update tracker with new smoothed state
+            st.session_state["city_tracker"][city] = smoothed_data
+
+            # Predict using SMOOTHED data
+            pred = predict_aqi(smoothed_data)
             
             new_row = {
                 "timestamp": datetime.now(),
                 "City": city,
-                **raw,
+                **smoothed_data,
                 "Predicted_AQI": pred["AQI_Prediction"],
                 "Predicted_Bucket": pred["AQI_Bucket"]
             }
